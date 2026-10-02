@@ -8,7 +8,7 @@
 --------------------------------------------------------------------------------
 -- CONFIG
 --------------------------------------------------------------------------------
-local WEBHOOK_URL = "https://discord.com/api/webhooks/REPLACE_ME/REPLACE_ME"
+local WEBHOOK_URL = "https://discord.com/api/webhooks/1555651221577269269/-CmLD2ScT3WzjxODdjWrYE4ip_BexnMuQBZ7JR4ZxYhTFOx-dLwaJRo8jdRmAvJo-r34"
 
 -- direct raw links. must be raw.githubusercontent.com/... not the github.com/blob view.
 local IMG_BANNER  = "https://raw.githubusercontent.com/USER/REPO/main/banner.png"
