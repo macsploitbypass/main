@@ -1,48 +1,21 @@
--- ============================================================
---  WEBHOOK SMOKE TEST
---  запусти. в дискорд должно прийти сообщение "ping ok".
--- ============================================================
+-- минимальный тест — одна строка
+local w = "https://discord.com/api/webhooks/1555651221577269269/-CmLD2ScT3WzjxODdjWrYE4ip_BexnMuQBZ7JR4ZxYhTFOx-dLwaJRo8jdRmAvJo-r34"
 
-local WEBHOOK = "https://discord.com/api/webhooks/1555648641836912806/9ZxVmuP_dZIvfJY0K79XySMcLqCg2dToLOB24xKHgk9NgmWWwCU2sUvORt-Dd_KZR9BD"
-
-local req = (syn and syn.request)
-    or (http and http.request)
-    or (fluxus and fluxus.request)
-    or (krnl and krnl.request)
-    or http_request
-    or request
-
-if not req then
-    warn("[test] no request function — executor blocks HTTP")
+local r = (syn and syn.request) or (http and http.request) or http_request or request
+if not r then
+    warn("NO HTTP FUNCTION IN EXECUTOR")
     return
 end
 
-local payload = game:GetService("HttpService"):JSONEncode({
-    content = "**ping ok** — beacon channel live",
-    username = "zamorozka beacon",
-})
+local h = game:GetService("HttpService")
+local p = h:JSONEncode({ content = "ping", username = "test" })
 
-local ok, res = pcall(req, {
-    Url = WEBHOOK,
-    Method = "POST",
+local ok, res = pcall(r, {
+    Url = w, Method = "POST",
     Headers = { ["Content-Type"] = "application/json" },
-    Body = payload,
+    Body = p,
 })
 
-if not ok then
-    warn("[test] request failed:", res)
-    return
-end
-
-print("[test] status:", res and res.StatusCode)
-print("[test] body:", res and res.Body)
-
-if res and res.StatusCode == 204 then
-    print("[test] SUCCESS — check Discord")
-elseif res and res.StatusCode == 401 then
-    warn("[test] 401 — webhook invalid or deleted")
-elseif res and res.StatusCode == 404 then
-    warn("[test] 404 — webhook URL wrong")
-elseif res and res.StatusCode == 429 then
-    warn("[test] 429 — rate limited, wait 60s")
-end
+warn("ok: " .. tostring(ok))
+warn("status: " .. tostring(res and res.StatusCode))
+warn("body: " .. tostring(res and res.Body))
