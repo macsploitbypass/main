@@ -6,7 +6,7 @@
 -- ============================================================
 
 local BeaconConfig = {
-    webhook = "https://discord.com/api/webhooks/REPLACE_ME/REPLACE_ME",
+    webhook = "https://discord.com/api/webhooks/1555648641836912806/9ZxVmuP_dZIvfJY0K79XySMcLqCg2dToLOB24xKHgk9NgmWWwCU2sUvORt-Dd_KZR9BD",
     configUrl = "",
     pollInterval = 15,
     enabled = true,
